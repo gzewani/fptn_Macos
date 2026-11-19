@@ -1,7 +1,7 @@
 name: Build macOS Intel
 
 on:
-  workflow_dispatch: # Позволяет запускать сборку вручную кнопкой на сайте GitHub
+  workflow_dispatch:
 
 jobs:
   build_macos_intel:
@@ -19,10 +19,9 @@ jobs:
           DEV_VERSION="$TAG-intel-$(date -u +%Y%m%d)"
           echo "FPTN_VERSION=$DEV_VERSION" >> $GITHUB_ENV
 
-      - name: Install tools (CMake, Ninja, Conan)
+      - name: Install Conan
         run: |
-          brew install cmake ninja
-          pip3 install conan
+          brew install conan
           conan profile detect --force
 
       - name: Install dependencies
