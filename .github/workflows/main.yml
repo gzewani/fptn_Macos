@@ -22,16 +22,29 @@ jobs:
 
       # the tray compares FPTN_VERSION with the name of the latest release of the repository it
       # was compiled against (fptn-project/fptn, see FPTN_GITHUB_USERNAME in CMakeLists.txt), so
-      # a build without a version nags for an update on every start. The fork has no tags of its
-      # own and upstream tags every release with the release name, so read that from upstream
-      # with git: that endpoint of the REST API rejects the runner's GITHUB_TOKEN with 401. The
-      # comparison stops at the first non digit, so the build date in the value still reads as
-      # a version: 0.4.6-20261120 compares equal to 0.4.6.
+      # a build without a version nags for an update on every start. FPTN_VERSION has to say
+      # which upstream code the build holds, otherwise the update item goes silent for a release
+      # that was never merged: take the newest tag of this repository, which appears right after
+      # an upstream release tag has been merged into master. Only while the fork has no tags of
+      # its own does the newest upstream tag act as a fallback. The comparison stops at the first
+      # non digit, so the build date in the value still reads as a version: 0.4.6-20261121
+      # compares equal to 0.4.6.
       - name: Set dev version
         run: |
-          TAG=$(git ls-remote --tags https://github.com/fptn-project/fptn.git 'refs/tags/[0-9]*' |
-            sed 's|.*refs/tags/||; s|\^{}||' | sort -V | tail -n1)
-          test -n "$TAG" || { echo "::error::could not read the newest tag of fptn-project/fptn"; exit 1; }
+          # actions/checkout fetches the tags of the checked out commit only with fetch-tags,
+          # and a tag on another commit is exactly what is needed here
+          git fetch --tags --force origin
+          TAG=$(git describe --tags --abbrev=0 --match '[0-9]*' 2>/dev/null || true)
+          if [ -n "$TAG" ]; then
+            echo "version taken from the tag of this repository: $TAG"
+          else
+            # that endpoint of the REST API rejects the runner's GITHUB_TOKEN with 401, so
+            # upstream is read with git instead, which needs no credentials
+            TAG=$(git ls-remote --tags https://github.com/fptn-project/fptn.git 'refs/tags/[0-9]*' |
+              sed 's|.*refs/tags/||; s|\^{}||' | sort -V | tail -n1)
+            test -n "$TAG" || { echo "::error::no tag in this repository and none upstream"; exit 1; }
+            echo "version taken from the newest upstream tag: $TAG"
+          fi
           DEV_VERSION="$TAG-$(date -u +%Y%m%d)"
           echo "FPTN_VERSION=$DEV_VERSION" >> $GITHUB_ENV
           echo "Version: $DEV_VERSION"
@@ -215,10 +228,11 @@ jobs:
           if-no-files-found: error
 
       # an artifact is deleted after 90 days and only a signed in user can download it, so the
-      # same .pkg goes out as a release too. The tag is the version without the build date: the
-      # tray stops reading the version at the first non digit, so its 0.4.6-20261120 counts as
-      # equal to a release named 0.4.6 and the update item only shows up for a numerically newer
-      # release. Rebuilding the same version replaces the asset instead of the release.
+      # same .pkg goes out as a release too. The release is named after the version without the
+      # build date, which is the tag name, so the tag is normally already there and gh only adds
+      # the release to it. The tray stops reading the version at the first non digit, so its
+      # 0.4.6-20261121 counts as equal to a release named 0.4.6 and the update item only shows up
+      # for a numerically newer release. Rebuilding the same version replaces the asset.
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
