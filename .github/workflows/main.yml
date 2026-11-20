@@ -54,13 +54,25 @@ jobs:
           grep -n -A2 '\[buildenv\]' "$profile"
 
       - name: Install dependencies
+        id: deps
         run: |
+          cache_kb() { du -sk ~/.conan2/p 2>/dev/null | awk '{print $1+0}'; }
+          before=$(cache_kb)
           conan install . --output-folder=build --build=missing \
             -s compiler.cppstd=17 \
             -o with_gui_client=True \
             -o "qt/*:with_md4c=False" \
             -c "tools.build:defines=['QT_NO_INT128']" \
             --settings build_type=Release
+          after=$(cache_kb)
+          echo "conan2/p size in KB, before: $before, after: $after"
+          # archiving 1.5 GB takes about ten minutes; a package built from source adds far more
+          # than this threshold, while conan install touching its metadata adds a few KB
+          if [ $((after - before)) -gt 20480 ]; then
+            echo changed=true >> "$GITHUB_OUTPUT"
+          else
+            echo changed=false >> "$GITHUB_OUTPUT"
+          fi
 
       # fails here instead of at the link step, ~10 minutes later. the undefined u8_/u32_
       # symbols are no sign of trouble: they are references between the members of the same
@@ -98,13 +110,15 @@ jobs:
           echo "OPENSSL_PKG=$openssl" >> $GITHUB_ENV
           echo "BROTLI_PKG=$brotli" >> $GITHUB_ENV
 
-      # cmake puts every plain -I before every -isystem, and the dependencies of fptn contribute
-      # -I /usr/local/include, which on this image holds Homebrew's openssl 3 headers. No include
-      # directory or flag added to the project can beat that, so let the compiler itself open the
-      # boringssl headers first - that is the openssl the whole build links anyway.
+      # the dependencies of fptn contribute -I /usr/local/include, which on this image holds
+      # Homebrew's openssl 3 headers. The compiler searches every -I directory before any
+      # -isystem one no matter where they sit on the command line, so that directory beats both
+      # an include_directories() of the project and an -isystem of a wrapper: only an -I placed
+      # before it can win, which is what the wrapper writes. boringssl is the openssl the whole
+      # build links anyway.
       - name: Wrap the compiler with the boringssl includes
         run: |
-          printf '#!/bin/bash\nexec /usr/bin/c++ -isystem "%s/include" "$@"\n' "$OPENSSL_PKG" > "$HOME/bssl-first"
+          printf '#!/bin/bash\nexec /usr/bin/c++ -I "%s/include" "$@"\n' "$OPENSSL_PKG" > "$HOME/bssl-first"
           chmod +x "$HOME/bssl-first"
           "$HOME/bssl-first" -dumpversion
 
@@ -188,7 +202,7 @@ jobs:
           if-no-files-found: error
 
       - name: Save conan cache
-        if: always()
+        if: always() && steps.deps.outputs.changed == 'true'
         uses: actions/cache/save@v4
         with:
           path: ~/.conan2
