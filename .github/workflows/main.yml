@@ -98,20 +98,27 @@ jobs:
           echo "OPENSSL_PKG=$openssl" >> $GITHUB_ENV
           echo "BROTLI_PKG=$brotli" >> $GITHUB_ENV
 
-      # CMAKE_CXX_FLAGS would land after the -isystem list, so use the project() injection
-      # point to put boringssl at the head of the include search instead.
+      # cmake puts every plain -I before every -isystem, and the dependencies of fptn contribute
+      # -I /usr/local/include, which on this image holds Homebrew's openssl 3 headers. No include
+      # directory or flag added to the project can beat that, so let the compiler itself open the
+      # boringssl headers first - that is the openssl the whole build links anyway.
+      - name: Wrap the compiler with the boringssl includes
+        run: |
+          printf '#!/bin/bash\nexec /usr/bin/c++ -isystem "%s/include" "$@"\n' "$OPENSSL_PKG" > "$HOME/bssl-first"
+          chmod +x "$HOME/bssl-first"
+          "$HOME/bssl-first" -dumpversion
+
       - name: Configure cmake
         run: |
           cd build
-          printf 'include_directories(BEFORE SYSTEM "%s/include")\n' "$OPENSSL_PKG" > openssl-first.cmake
           cmake .. -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCMAKE_CXX_COMPILER="$HOME/bssl-first" \
             -DOPENSSL_ROOT_DIR="$OPENSSL_PKG" \
             -DBROTLI_INCLUDE_DIR="$BROTLI_PKG/include" \
             -DBROTLI_DEC_LIB="$BROTLI_PKG/lib/libbrotlidec.a" \
             -DBROTLI_COMMON_LIB="$BROTLI_PKG/lib/libbrotlicommon.a" \
-            -DBROTLI_ENC_LIB="$BROTLI_PKG/lib/libbrotlienc.a" \
-            -DCMAKE_PROJECT_INCLUDE="$PWD/openssl-first.cmake"
+            -DBROTLI_ENC_LIB="$BROTLI_PKG/lib/libbrotlienc.a"
 
       # the compile of tray.cpp succeeds either way, the difference shows up only at link time,
       # so compile that one translation unit for real out of compile_commands.json and look at
