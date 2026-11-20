@@ -29,20 +29,29 @@ jobs:
           echo "$HOME/venv/bin" >> $GITHUB_PATH
           $HOME/venv/bin/pip install --upgrade pip "conan>=2.15,<3.0" macos-pkg-builder
           $HOME/venv/bin/conan profile detect --force
-          # On Intel images Homebrew keeps libunistring in /usr/local, so libidn2's configure
-          # links against it and its recipe never propagates that dependency - executables that
-          # use libidn2 fail to link. This cache var makes configure skip the system copy and
-          # compile the libunistring sources that libidn2 bundles instead.
-          printf '[buildenv]\nac_cv_libunistring=no\n' >> "$($HOME/venv/bin/conan profile path default)"
 
-      # bump the v1 salt whenever the conan invocation below changes: a restored cache keeps
-      # the packages built with the old settings
-      - name: Cache conan
-        uses: actions/cache@v4
+      # split restore/save so the cache is kept even when a later step fails: building the
+      # dependencies from source takes about an hour and would otherwise be repeated
+      # bump the v2 salt whenever the conan invocation or the profile below changes, a
+      # restored cache keeps the packages built with the old settings
+      - name: Restore conan cache
+        id: conan-cache
+        uses: actions/cache/restore@v4
         with:
           path: ~/.conan2
-          key: conan-v1-${{ hashFiles('conanfile.py', '.conan/**') }}
-          restore-keys: conan-v1-
+          key: conan-v2-${{ hashFiles('conanfile.py', '.conan/**') }}
+          restore-keys: conan-v2-
+
+      # On Intel images Homebrew keeps libunistring in /usr/local, so libidn2's configure
+      # links against it and its recipe never propagates that dependency - executables that
+      # use libidn2 fail to link. This cache var makes configure skip the system copy and
+      # compile the libunistring sources that libidn2 bundles instead. Applied after the
+      # cache restore because a restored ~/.conan2 replaces the profile.
+      - name: Patch conan profile
+        run: |
+          profile=$($HOME/venv/bin/conan profile path default)
+          grep -q '^ac_cv_libunistring=no' "$profile" || printf '[buildenv]\nac_cv_libunistring=no\n' >> "$profile"
+          grep -n -A2 '\[buildenv\]' "$profile"
 
       - name: Install dependencies
         run: |
@@ -53,17 +62,18 @@ jobs:
             -c "tools.build:defines=['QT_NO_INT128']" \
             --settings build_type=Release
 
-      # fails here instead of at the link step, ~10 minutes later
+      # fails here instead of at the link step, ~10 minutes later. the undefined u8_/u32_
+      # symbols are no sign of trouble: they are references between the members of the same
+      # archive, which the linker resolves. what matters is that the archive itself holds the
+      # bundled libunistring objects that define them.
       - name: Check libidn2
         run: |
           libidn2=$(find ~/.conan2 -type f -name libidn2.a -path "*/p/lib/*" | head -n1)
           echo "found: $libidn2"
           test -n "$libidn2" || { echo "::error::no libidn2.a under ~/.conan2"; exit 1; }
-          if nm -u "$libidn2" | grep -qE '_u(8|32)_'; then
-            echo "::error::libidn2 still needs system libunistring - bump the Cache conan key"
-            nm -u "$libidn2" | grep -E '_u(8|32)_' | head
-            exit 1
-          fi
+          members=$(ar -t "$libidn2" | { grep -c '^libunistring_la' || true; })
+          echo "bundled libunistring objects inside libidn2.a: $members"
+          test "$members" -gt 0 || { echo "::error::libidn2.a has no bundled libunistring - the profile patch was not used, bump the cache key"; exit 1; }
 
       # the .pkg contains only these two binaries; tests and fptn-server are not packaged.
       # no --parallel: the blocklist generator writes files shared by both client targets
@@ -86,4 +96,11 @@ jobs:
           name: FPTN-macOS-Intel
           path: "**/*.pkg"
           if-no-files-found: error
+
+      - name: Save conan cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.conan2
+          key: ${{ steps.conan-cache.outputs.cache-primary-key }}
 
