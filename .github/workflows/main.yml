@@ -75,20 +75,28 @@ jobs:
           echo "bundled libunistring objects inside libidn2.a: $members"
           test "$members" -gt 0 || { echo "::error::libidn2.a has no bundled libunistring - the profile patch was not used, bump the cache key"; exit 1; }
 
-      # gui/autoupdate.h turns on httplib's SSL support, which only compiles against
-      # boringssl if the boringssl headers win the include search: they define
-      # OPENSSL_IS_BORINGSSL, which switches httplib off the SSL_CTX_ctrl family that
-      # boringssl does not implement. Take the package folder from the CMakeDeps file.
-      - name: Locate conan openssl
-        id: openssl
+      # gui/autoupdate.h turns on httplib's SSL support, which only compiles against boringssl
+      # if the boringssl headers win the include search: they define OPENSSL_IS_BORINGSSL, which
+      # switches httplib off the SSL_ctrl family that boringssl does not implement. Take the
+      # package folders from the CMakeDeps files: fptn's own find_path and find_library calls are
+      # free to pick the Homebrew copies in /usr/local instead, and an -I of that directory lands
+      # before every -isystem of a conan package.
+      - name: Locate conan packages
         run: |
-          data=$(find build -maxdepth 2 -name "OpenSSL-*-data.cmake" | head -n1)
-          echo "generator file: $data"
-          test -n "$data" || { echo "::error::no OpenSSL-*-data.cmake under build/"; exit 1; }
-          root=$(sed -n 's/^[[:space:]]*set([A-Za-z0-9_]*_PACKAGE_FOLDER_RELEASE "\(.*\)")/\1/p' "$data" | head -n1)
-          echo "package folder: $root"
-          test -f "$root/include/openssl/base.h" || { echo "::error::no boringssl headers in $root"; exit 1; }
-          echo "OPENSSL_PKG=$root" >> $GITHUB_ENV
+          pkgfolder() {
+            data=$(find build -maxdepth 2 -name "$1-*-data.cmake" | head -n1)
+            test -n "$data" || return 1
+            echo "generator file for $1: $data" >&2
+            sed -n 's/^[[:space:]]*set([A-Za-z0-9_]*_PACKAGE_FOLDER_RELEASE "\(.*\)")/\1/p' "$data" | head -n1
+          }
+          openssl=$(pkgfolder OpenSSL) || { echo "::error::no OpenSSL-*-data.cmake under build/"; exit 1; }
+          echo "boringssl package folder: $openssl"
+          test -f "$openssl/include/openssl/base.h" || { echo "::error::no boringssl headers in $openssl"; exit 1; }
+          brotli=$(pkgfolder brotli) || { echo "::error::no brotli-*-data.cmake under build/"; exit 1; }
+          echo "brotli package folder: $brotli"
+          test -f "$brotli/include/brotli/decode.h" || { echo "::error::no brotli headers in $brotli"; exit 1; }
+          echo "OPENSSL_PKG=$openssl" >> $GITHUB_ENV
+          echo "BROTLI_PKG=$brotli" >> $GITHUB_ENV
 
       # CMAKE_CXX_FLAGS would land after the -isystem list, so use the project() injection
       # point to put boringssl at the head of the include search instead.
@@ -97,30 +105,59 @@ jobs:
           cd build
           printf 'include_directories(BEFORE SYSTEM "%s/include")\n' "$OPENSSL_PKG" > openssl-first.cmake
           cmake .. -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             -DOPENSSL_ROOT_DIR="$OPENSSL_PKG" \
+            -DBROTLI_INCLUDE_DIR="$BROTLI_PKG/include" \
+            -DBROTLI_DEC_LIB="$BROTLI_PKG/lib/libbrotlidec.a" \
+            -DBROTLI_COMMON_LIB="$BROTLI_PKG/lib/libbrotlicommon.a" \
+            -DBROTLI_ENC_LIB="$BROTLI_PKG/lib/libbrotlienc.a" \
             -DCMAKE_PROJECT_INCLUDE="$PWD/openssl-first.cmake"
 
-      # preprocess a probe TU with the exact flags make uses for tray.cpp: -H prints the path
-      # of every header the compiler opens, so this says which openssl the gui target really
-      # compiles against. a real openssl there means the link fails, because cpp-httplib only
-      # skips the SSL_ctrl family when the boringssl macro from openssl/base.h is defined.
-      # it costs seconds, the build it replaces costs ten minutes.
-      - name: Probe gui openssl headers
+      # the compile of tray.cpp succeeds either way, the difference shows up only at link time,
+      # so compile that one translation unit for real out of compile_commands.json and look at
+      # the openssl symbols it asks for. 35 seconds instead of the ten minutes the gui needs.
+      - name: Probe the gui tray compile
         run: |
-          flags=build/src/fptn-client/CMakeFiles/fptn-client-gui.dir/flags.make
-          test -f "$flags" || { echo "::error::no flags.make for fptn-client-gui"; exit 1; }
-          grep -i openssl build/CMakeCache.txt | head -20
-          defs=$(sed -n 's/^CXX_DEFINES = //p' "$flags")
-          incs=$(sed -n 's/^CXX_INCLUDES = //p' "$flags")
-          flgs=$(sed -n 's/^CXX_FLAGS = //p' "$flags")
-          printf '#include <openssl/ssl.h>\n' > /tmp/probe.cpp
-          c++ $defs $incs $flgs -fsyntax-only -H /tmp/probe.cpp 2>/tmp/probe.log \
-            || { echo "::error::the probe did not compile"; tail -20 /tmp/probe.log; exit 1; }
-          grep -E 'openssl/(ssl|base|opensslv)\.h' /tmp/probe.log | head -8
-          macros=$(c++ $defs $incs $flgs -E -dM /tmp/probe.cpp 2>/dev/null || true)
-          echo "$macros" | grep -E 'define OPENSSL_VERSION_NUMBER|OPENSSL_IS_BORINGSSL' || true
-          echo "$macros" | grep -q 'OPENSSL_IS_BORINGSSL' \
-            || { echo "::error::fptn-client-gui compiles against a real openssl but links the boringssl above - see the header paths it opened"; exit 1; }
+          grep -E 'BROTLI_|_OPENSSL|CMAKE_CXX_COMPILER:' build/CMakeCache.txt | head -25
+          python3 -I - <<'PY'
+          import json, shlex, subprocess, sys
+          db = json.load(open("build/compile_commands.json"))
+          e = [x for x in db if x["file"].endswith("gui/tray/tray.cpp")][0]
+          cmd = shlex.split(e["command"])
+          print("compiler:", cmd[0])
+          i, n = 1, 0
+          while i < len(cmd):
+              t = cmd[i]
+              if t in ("-I", "-isystem"):
+                  n += 1
+                  print("#%d %s %s" % (n, t, cmd[i + 1]))
+                  i += 2
+                  continue
+              if t.startswith("-I") and len(t) > 2:
+                  n += 1
+                  print("#%d %s" % (n, t))
+              i += 1
+          args, skip = [], False
+          for t in cmd:
+              if skip:
+                  skip = False
+                  continue
+              if t == "-o":
+                  skip = True
+                  continue
+              args.append(t)
+          r = subprocess.run(args + ["-o", "/tmp/tray_probe.o"], cwd=e["directory"],
+                             capture_output=True, text=True)
+          print("compile returncode:", r.returncode)
+          print((r.stderr or "")[-3000:])
+          if r.returncode:
+              sys.exit(1)
+          nm = subprocess.run(["nm", "-u", "/tmp/tray_probe.o"], capture_output=True, text=True)
+          missing = [s for s in ("_SSL_CTX_ctrl", "_SSL_ctrl", "_SSL_get1_peer_certificate")
+                     if s in nm.stdout]
+          print("openssl symbols boringssl does not provide:", missing or "none")
+          sys.exit(1 if missing else 0)
+          PY
 
       # the .pkg contains only these two binaries; tests and fptn-server are not packaged.
       # no --parallel: the blocklist generator writes files shared by both client targets
