@@ -3,6 +3,9 @@ name: Build macOS Intel
 on:
   workflow_dispatch:
 
+env:
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
 jobs:
   build_macos_intel:
     runs-on: macos-15-intel
@@ -18,36 +21,39 @@ jobs:
           TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0")
           DEV_VERSION="$TAG-intel-$(date -u +%Y%m%d)"
           echo "FPTN_VERSION=$DEV_VERSION" >> $GITHUB_ENV
+          echo "Version: $DEV_VERSION"
 
       - name: Install Conan
         run: |
-          brew install conan
-          conan profile detect --force
+          python3 -m venv $HOME/venv
+          echo "$HOME/venv/bin" >> $GITHUB_PATH
+          $HOME/venv/bin/pip install --upgrade pip "conan>=2.15,<3.0"
+          $HOME/venv/bin/conan profile detect --force
 
       - name: Install dependencies
         run: |
           conan install . --output-folder=build --build=missing \
-            -o with_gui_client=True \
-            --settings build_type=Release \
             -s compiler.cppstd=17 \
-            -c "tools.build:defines=['QT_NO_INT128']"
+            -o with_gui_client=True \
+            -o "qt/*:with_md4c=False" \
+            -c "tools.build:defines=['QT_NO_INT128']" \
+            --settings build_type=Release
 
       - name: Build
         run: |
           cd build
-          cmake .. -G Ninja -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release
-          cmake --build . --config Release
+          cmake .. -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release
+          cmake --build . --config Release --parallel
 
       - name: Build macOS pkg
         run: |
           cd build
-          cmake --build . --target build-pkg
+          cmake --build . --config Release --target build-pkg
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: FPTN-macOS-Intel
-          path: |
-            *.pkg
-            build/*.pkg
-          if-no-files-found: warn
+          path: "**/*.pkg"
+          if-no-files-found: error
+
