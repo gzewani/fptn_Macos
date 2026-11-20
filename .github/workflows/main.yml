@@ -33,7 +33,7 @@ jobs:
           # links against it and its recipe never propagates that dependency - executables that
           # use libidn2 fail to link. This cache var makes configure skip the system copy and
           # compile the libunistring sources that libidn2 bundles instead.
-          printf '[buildenv]\nac_cv_libunistring=no\n' >> "$(conan profile path default)"
+          printf '[buildenv]\nac_cv_libunistring=no\n' >> "$($HOME/venv/bin/conan profile path default)"
 
       # bump the v1 salt whenever the conan invocation below changes: a restored cache keeps
       # the packages built with the old settings
@@ -57,7 +57,8 @@ jobs:
       - name: Check libidn2
         run: |
           libidn2=$(find ~/.conan2 -type f -name libidn2.a -path "*/p/lib/*" | head -n1)
-          echo "$libidn2"
+          echo "found: $libidn2"
+          test -n "$libidn2" || { echo "::error::no libidn2.a under ~/.conan2"; exit 1; }
           if nm -u "$libidn2" | grep -qE '_u(8|32)_'; then
             echo "::error::libidn2 still needs system libunistring - bump the Cache conan key"
             nm -u "$libidn2" | grep -E '_u(8|32)_' | head
