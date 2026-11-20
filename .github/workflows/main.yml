@@ -6,6 +6,10 @@ on:
 env:
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
+# the publish step below makes a tag and uploads the .pkg with the token of the run
+permissions:
+  contents: write
+
 jobs:
   build_macos_intel:
     runs-on: macos-15-intel
@@ -18,15 +22,16 @@ jobs:
 
       # the tray compares FPTN_VERSION with the name of the latest release of the repository it
       # was compiled against (fptn-project/fptn, see FPTN_GITHUB_USERNAME in CMakeLists.txt), so
-      # a build without a version nags for an update on every start. Take that name; the
-      # comparison stops at the first non digit, so the build date in 0.4.6-20261120 still reads
-      # as 0.4.6. The fork itself has no tags, so git describe gives nothing.
+      # a build without a version nags for an update on every start. The fork has no tags of its
+      # own and upstream tags every release with the release name, so read that from upstream
+      # with git: that endpoint of the REST API rejects the runner's GITHUB_TOKEN with 401. The
+      # comparison stops at the first non digit, so the build date in the value still reads as
+      # a version: 0.4.6-20261120 compares equal to 0.4.6.
       - name: Set dev version
         run: |
-          TAG=$(curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
-            https://api.github.com/repos/fptn-project/fptn/releases/latest |
-            python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("name",""))')
-          test -n "$TAG" || { echo "::error::could not read the latest release of fptn-project/fptn"; exit 1; }
+          TAG=$(git ls-remote --tags https://github.com/fptn-project/fptn.git 'refs/tags/[0-9]*' |
+            sed 's|.*refs/tags/||; s|\^{}||' | sort -V | tail -n1)
+          test -n "$TAG" || { echo "::error::could not read the newest tag of fptn-project/fptn"; exit 1; }
           DEV_VERSION="$TAG-$(date -u +%Y%m%d)"
           echo "FPTN_VERSION=$DEV_VERSION" >> $GITHUB_ENV
           echo "Version: $DEV_VERSION"
@@ -208,6 +213,24 @@ jobs:
           name: FPTN-macOS-Intel
           path: "**/*.pkg"
           if-no-files-found: error
+
+      # an artifact is deleted after 90 days and only a signed in user can download it, so the
+      # same .pkg goes out as a release too. The tag is the version without the build date: the
+      # tray stops reading the version at the first non digit, so its 0.4.6-20261120 counts as
+      # equal to a release named 0.4.6 and the update item only shows up for a numerically newer
+      # release. Rebuilding the same version replaces the asset instead of the release.
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pkg=$(find . -maxdepth 2 -name "*.pkg" | head -n1)
+          test -n "$pkg" || { echo "::error::no .pkg found to publish"; exit 1; }
+          RELEASE="${FPTN_VERSION%%-*}"
+          echo "release: $RELEASE, asset: $pkg"
+          gh release view "$RELEASE" > /dev/null 2>&1 ||
+            gh release create "$RELEASE" --title "FPTN client, macOS Intel, $RELEASE" \
+              --notes="Unsigned build of the FPTN client for Intel Macs. Open the .pkg with a right click, then Open."
+          gh release upload "$RELEASE" "$pkg" --clobber
 
       - name: Save conan cache
         if: always() && steps.deps.outputs.changed == 'true'
