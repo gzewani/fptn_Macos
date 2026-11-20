@@ -16,9 +16,17 @@ jobs:
           submodules: true
           fetch-depth: 0
 
+      # the tray compares FPTN_VERSION with the name of the latest release of the repository it
+      # was compiled against (fptn-project/fptn, see FPTN_GITHUB_USERNAME in CMakeLists.txt), so
+      # a build without a version nags for an update on every start. Take that name; the
+      # comparison stops at the first non digit, so the build date in 0.4.6-20261120 still reads
+      # as 0.4.6. The fork itself has no tags, so git describe gives nothing.
       - name: Set dev version
         run: |
-          TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0")
+          TAG=$(curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
+            https://api.github.com/repos/fptn-project/fptn/releases/latest |
+            python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("name",""))')
+          test -n "$TAG" || { echo "::error::could not read the latest release of fptn-project/fptn"; exit 1; }
           DEV_VERSION="$TAG-$(date -u +%Y%m%d)"
           echo "FPTN_VERSION=$DEV_VERSION" >> $GITHUB_ENV
           echo "Version: $DEV_VERSION"
