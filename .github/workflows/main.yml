@@ -75,13 +75,59 @@ jobs:
           echo "bundled libunistring objects inside libidn2.a: $members"
           test "$members" -gt 0 || { echo "::error::libidn2.a has no bundled libunistring - the profile patch was not used, bump the cache key"; exit 1; }
 
+      # gui/autoupdate.h turns on httplib's SSL support, which only compiles against
+      # boringssl if the boringssl headers win the include search: they define
+      # OPENSSL_IS_BORINGSSL, which switches httplib off the SSL_CTX_ctrl family that
+      # boringssl does not implement. Take the package folder from the CMakeDeps file.
+      - name: Locate conan openssl
+        id: openssl
+        run: |
+          data=$(find build -maxdepth 2 -name "OpenSSL-*-data.cmake" | head -n1)
+          echo "generator file: $data"
+          test -n "$data" || { echo "::error::no OpenSSL-*-data.cmake under build/"; exit 1; }
+          root=$(sed -n 's/^[[:space:]]*set([A-Za-z0-9_]*_PACKAGE_FOLDER_RELEASE "\(.*\)")/\1/p' "$data" | head -n1)
+          echo "package folder: $root"
+          test -f "$root/include/openssl/base.h" || { echo "::error::no boringssl headers in $root"; exit 1; }
+          echo "OPENSSL_PKG=$root" >> $GITHUB_ENV
+
+      # CMAKE_CXX_FLAGS would land after the -isystem list, so use the project() injection
+      # point to put boringssl at the head of the include search instead.
+      - name: Configure cmake
+        run: |
+          cd build
+          printf 'include_directories(BEFORE SYSTEM "%s/include")\n' "$OPENSSL_PKG" > openssl-first.cmake
+          cmake .. -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_PKG" \
+            -DCMAKE_PROJECT_INCLUDE="$PWD/openssl-first.cmake"
+
+      # preprocess a probe TU with the exact flags make uses for tray.cpp: -H prints the path
+      # of every header the compiler opens, so this says which openssl the gui target really
+      # compiles against. a real openssl there means the link fails, because cpp-httplib only
+      # skips the SSL_ctrl family when the boringssl macro from openssl/base.h is defined.
+      # it costs seconds, the build it replaces costs ten minutes.
+      - name: Probe gui openssl headers
+        run: |
+          flags=build/src/fptn-client/CMakeFiles/fptn-client-gui.dir/flags.make
+          test -f "$flags" || { echo "::error::no flags.make for fptn-client-gui"; exit 1; }
+          grep -i openssl build/CMakeCache.txt | head -20
+          defs=$(sed -n 's/^CXX_DEFINES = //p' "$flags")
+          incs=$(sed -n 's/^CXX_INCLUDES = //p' "$flags")
+          flgs=$(sed -n 's/^CXX_FLAGS = //p' "$flags")
+          printf '#include <openssl/ssl.h>\n' > /tmp/probe.cpp
+          c++ $defs $incs $flgs -fsyntax-only -H /tmp/probe.cpp 2>/tmp/probe.log \
+            || { echo "::error::the probe did not compile"; tail -20 /tmp/probe.log; exit 1; }
+          grep -E 'openssl/(ssl|base|opensslv)\.h' /tmp/probe.log | head -8
+          macros=$(c++ $defs $incs $flgs -E -dM /tmp/probe.cpp 2>/dev/null || true)
+          echo "$macros" | grep -E 'define OPENSSL_VERSION_NUMBER|OPENSSL_IS_BORINGSSL' || true
+          echo "$macros" | grep -q 'OPENSSL_IS_BORINGSSL' \
+            || { echo "::error::fptn-client-gui compiles against a real openssl but links the boringssl above - see the header paths it opened"; exit 1; }
+
       # the .pkg contains only these two binaries; tests and fptn-server are not packaged.
       # no --parallel: the blocklist generator writes files shared by both client targets
       # and two concurrent runs of it delete each other's partial download.
       - name: Build
         run: |
           cd build
-          cmake .. -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release
           cmake --build . --config Release --target fptn-client-cli
           cmake --build . --config Release --target fptn-client-gui
 
