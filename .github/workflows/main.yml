@@ -19,7 +19,7 @@ jobs:
       - name: Set dev version
         run: |
           TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0")
-          DEV_VERSION="$TAG-intel-$(date -u +%Y%m%d)"
+          DEV_VERSION="$TAG-$(date -u +%Y%m%d)"
           echo "FPTN_VERSION=$DEV_VERSION" >> $GITHUB_ENV
           echo "Version: $DEV_VERSION"
 
@@ -27,8 +27,22 @@ jobs:
         run: |
           python3 -m venv $HOME/venv
           echo "$HOME/venv/bin" >> $GITHUB_PATH
-          $HOME/venv/bin/pip install --upgrade pip "conan>=2.15,<3.0"
+          $HOME/venv/bin/pip install --upgrade pip "conan>=2.15,<3.0" macos-pkg-builder
           $HOME/venv/bin/conan profile detect --force
+          # On Intel images Homebrew keeps libunistring in /usr/local, so libidn2's configure
+          # links against it and its recipe never propagates that dependency - executables that
+          # use libidn2 fail to link. This cache var makes configure skip the system copy and
+          # compile the libunistring sources that libidn2 bundles instead.
+          printf '[buildenv]\nac_cv_libunistring=no\n' >> "$(conan profile path default)"
+
+      # bump the v1 salt whenever the conan invocation below changes: a restored cache keeps
+      # the packages built with the old settings
+      - name: Cache conan
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2
+          key: conan-v1-${{ hashFiles('conanfile.py', '.conan/**') }}
+          restore-keys: conan-v1-
 
       - name: Install dependencies
         run: |
@@ -39,11 +53,26 @@ jobs:
             -c "tools.build:defines=['QT_NO_INT128']" \
             --settings build_type=Release
 
+      # fails here instead of at the link step, ~10 minutes later
+      - name: Check libidn2
+        run: |
+          libidn2=$(find ~/.conan2 -type f -name libidn2.a -path "*/p/lib/*" | head -n1)
+          echo "$libidn2"
+          if nm -u "$libidn2" | grep -qE '_u(8|32)_'; then
+            echo "::error::libidn2 still needs system libunistring - bump the Cache conan key"
+            nm -u "$libidn2" | grep -E '_u(8|32)_' | head
+            exit 1
+          fi
+
+      # the .pkg contains only these two binaries; tests and fptn-server are not packaged.
+      # no --parallel: the blocklist generator writes files shared by both client targets
+      # and two concurrent runs of it delete each other's partial download.
       - name: Build
         run: |
           cd build
           cmake .. -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release
-          cmake --build . --config Release --parallel
+          cmake --build . --config Release --target fptn-client-cli
+          cmake --build . --config Release --target fptn-client-gui
 
       - name: Build macOS pkg
         run: |
